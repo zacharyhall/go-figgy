@@ -3,6 +3,8 @@ package figgy
 
 import (
 	"bytes"
+	"encoding/json"
+	"encoding/xml"
 	"errors"
 	"reflect"
 	"strconv"
@@ -18,6 +20,18 @@ import (
 type InvalidTypeError struct {
 	Type reflect.Type
 }
+
+// DataFormat represents different types of structured data formats, such as XML or JSON
+type DataFormat int
+
+const (
+	// NAF denotes non formated data (Not A Format)
+	NAF DataFormat = 1 + iota
+	// JSON denotes JSON formated data
+	JSON
+	// XML denotes XML formated data
+	XML
+)
 
 func (e *InvalidTypeError) Error() string {
 	if e.Type == nil {
@@ -65,12 +79,16 @@ type field struct {
 	decrypt bool
 	value   reflect.Value
 	field   reflect.StructField
+	json    bool
+	xml     bool
 }
 
-func newField(key string, decrypt bool) *field {
+func newField(key string, decrypt bool, json bool, xml bool) *field {
 	return &field{
 		key:     strings.TrimSpace(key),
 		decrypt: decrypt,
+		json:    json,
+		xml:     xml,
 	}
 }
 
@@ -117,7 +135,17 @@ func load(c ssmiface.SSMAPI, f []*field) error {
 		if err != nil {
 			return err
 		}
-		err = set(x.value, *out.Parameter.Value)
+
+		var df DataFormat
+		if x.json {
+			df = JSON
+		} else if x.xml {
+			df = XML
+		} else {
+			df = NAF
+		}
+
+		err = set(x.value, *out.Parameter.Value, df)
 		if err != nil {
 			switch err := err.(type) {
 			case *ConvertTypeError:
@@ -149,6 +177,16 @@ func walk(v reflect.Value, data interface{}) ([]*field, error) {
 		}
 		switch fv.Kind() {
 		case reflect.Struct:
+			// need this logic first so that the json unmarshaling does not override the values
+			pf, err := tag(ft, data)
+			if err != nil {
+				return nil, err
+			}
+			if pf != nil {
+				pf.field = ft
+				pf.value = fv
+				p = append(p, pf)
+			}
 			tags, err := walk(fv, data)
 			if err != nil {
 				return nil, err
@@ -176,7 +214,7 @@ func tag(f reflect.StructField, data interface{}) (*field, error) {
 		return nil, nil
 	}
 	o := strings.Split(t, ",")
-	fld := newField(strings.TrimSpace(o[0]), false)
+	fld := newField(strings.TrimSpace(o[0]), false, false, false)
 	if fld.key == "" {
 		return nil, &TagParseError{Tag: t, Field: f.Name}
 	}
@@ -193,21 +231,58 @@ func tag(f reflect.StructField, data interface{}) (*field, error) {
 		case "decrypt":
 			fld.decrypt = true
 		}
+
+		// we should switch separately and break for possible
+		// data formats because only one data type format
+		// should be supported for a given tag at a time
+		switch strings.TrimSpace(option) {
+		case "json":
+			fld.json = true
+			break
+		case "xml":
+			fld.xml = true
+			break
+		}
 	}
 	return fld, nil
 }
 
 // set will attempt to set the underlying value based on the value's type
-func set(v reflect.Value, s string) error {
+func set(v reflect.Value, s string, df DataFormat) error {
 	if !v.CanSet() {
 		return errors.New(v.Type().String() + " cannot be set")
 	}
 	switch v.Kind() {
+	case reflect.Struct:
+		out := reflect.New(v.Type()).Interface()
+		switch df {
+		case JSON:
+			if err := json.Unmarshal([]byte(s), &out); err != nil {
+				return &ConvertTypeError{
+					Type:  v.Type().String(),
+					Value: s,
+				}
+			}
+			break
+		case XML:
+			if err := xml.Unmarshal([]byte(s), &out); err != nil {
+				return &ConvertTypeError{
+					Type:  v.Type().String(),
+					Value: s,
+				}
+			}
+			break
+
+		}
+
+		vOut := reflect.ValueOf(out).Elem()
+		v.Set(vOut)
+		break
 	// handles the case data types are wrapped in other constructs, EG slices
 	case reflect.Ptr:
 		// create new pointer to a zero value
 		new := reflect.New(v.Type().Elem())
-		set(new.Elem(), s)
+		set(new.Elem(), s, df)
 		// assign new pointer
 		v.Set(new)
 		break
@@ -217,7 +292,7 @@ func set(v reflect.Value, s string) error {
 		sz := len(l)
 		v.Set(reflect.MakeSlice(v.Type(), sz, sz))
 		for i, w := range l {
-			set(v.Index(i), w)
+			set(v.Index(i), w, df)
 		}
 		break
 	case reflect.String:

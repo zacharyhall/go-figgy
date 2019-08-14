@@ -1,6 +1,7 @@
 package figgy
 
 import (
+	"encoding/xml"
 	"reflect"
 	"testing"
 
@@ -241,6 +242,37 @@ func NewMockSSMClient() *MockSSMClient {
 				Value: aws.String("1,2,3,4,5"),
 			},
 		},
+		"jsonString": {
+			Parameter: &ssm.Parameter{
+				Name:  aws.String("jsonString"),
+				Type:  aws.String("string"),
+				Value: aws.String(`{"name": "Ashley", "age": 25}`),
+			},
+		},
+		"xmlString": {
+			Parameter: &ssm.Parameter{
+				Name: aws.String("xmlString"),
+				Type: aws.String("string"),
+				Value: aws.String(`
+				<Person>
+					<FullName>Zachary Hall</FullName>
+					<Company>Syncbak, Inc.</Company>
+					<Email where="home">
+						<Addr>zach@home.com</Addr>
+					</Email>
+					<Email where='work'>
+						<Addr>zach@work.com</Addr>
+					</Email>
+					<Group>
+						<Value>Developer</Value>
+						<Value>Cool Person</Value>
+					</Group>
+					<City>Marion</City>
+					<State>Iowa</State>
+				</Person>
+			`),
+			},
+		},
 	}
 	return m
 }
@@ -391,6 +423,21 @@ func TestTagParse(t *testing.T) {
 			Fields string `ssm:"/{{.Env}}/environment"`
 		}{}, want: &field{key: "/dev/environment"},
 			data: struct{ Env string }{"dev"}},
+		"dontIgnoreStructWithKey": {in: struct {
+			Field struct{} `ssm:"parsed"`
+		}{}, want: &field{key: "parsed"}, err: nil},
+		"structWithJson": {in: struct {
+			Field struct{} `ssm:"parsed,json"`
+		}{}, want: &field{key: "parsed", json: true}, err: nil},
+		"structWithXml": {in: struct {
+			Field struct{} `ssm:"parsed,xml"`
+		}{}, want: &field{key: "parsed", xml: true}, err: nil},
+		"structWithJsonAndDecrypt": {in: struct {
+			Field struct{} `ssm:"parsed,decrypt,json"`
+		}{}, want: &field{key: "parsed", json: true, decrypt: true}, err: nil},
+		"structWithXmlAndDecrypt": {in: struct {
+			Field struct{} `ssm:"parsed,decrypt,xml"`
+		}{}, want: &field{key: "parsed", xml: true, decrypt: true}, err: nil},
 	}
 
 	for n, tc := range tests {
@@ -403,5 +450,82 @@ func TestTagParse(t *testing.T) {
 		if err != nil {
 			assert.EqualError(t, err, tc.err.Error())
 		}
+	}
+}
+
+func TestTypeStructs(t *testing.T) {
+	type TestJSONStruct struct {
+		Name         string `json:"name"`
+		Age          int64  `json:"age"`
+		SecretString string `ssm:"string"`
+	}
+
+	type Email struct {
+		Where string `xml:"where,attr"`
+		Addr  string
+	}
+	type Address struct {
+		City, State string
+	}
+	type Result struct {
+		XMLName xml.Name `xml:"Person"`
+		Name    string   `xml:"FullName"`
+		Company string   `xml:"Company"`
+		Email   []Email
+		Groups  []string `xml:"Group>Value"`
+		Address
+	}
+	type TestStruct struct {
+		Field1 TestJSONStruct `ssm:"jsonString,json"`
+		Field2 Result         `ssm:"xmlString,xml"`
+	}
+
+	tests := map[string]struct {
+		in   TestStruct
+		want *TestStruct
+		err  error
+	}{
+		"Unmarshal json and xml": {in: TestStruct{}, want: &TestStruct{
+			Field1: TestJSONStruct{Name: "Ashley", Age: 25, SecretString: "this is a string"},
+			Field2: Result{
+				Name:    "Zachary Hall",
+				Company: "Syncbak, Inc.",
+				Email: []Email{
+					Email{
+						Where: "home",
+						Addr:  "zach@home.com",
+					},
+					Email{
+						Where: "work",
+						Addr:  "zach@work.com",
+					},
+				},
+				Groups: []string{
+					"Developer",
+					"Cool Person",
+				},
+				Address: Address{
+					City:  "Marion",
+					State: "Iowa",
+				},
+			},
+		}, err: nil},
+	}
+
+	for _, tc := range tests {
+		err := Load(NewMockSSMClient(), &tc.in)
+		if err != nil {
+
+		}
+		assert.Equal(t, tc.want.Field1.Name, tc.in.Field1.Name, "Field1 Name do not match for test")
+		assert.Equal(t, tc.want.Field1.Age, tc.in.Field1.Age, "Field1 Age do not match for test")
+		assert.Equal(t, tc.want.Field1.SecretString, tc.in.Field1.SecretString, "Field1 SecretString do not match for test")
+		assert.Equal(t, tc.want.Field2.Name, tc.in.Field2.Name, "Field2 Name do not match for test")
+		assert.Equal(t, tc.want.Field2.Company, tc.in.Field2.Company, "Field2 Company do not match for test")
+		assert.Equal(t, tc.want.Field2.Email, tc.in.Field2.Email, "Field2 Emails do not match for test")
+		assert.Equal(t, tc.want.Field2.Groups, tc.in.Field2.Groups, "Field2 Groups do not match for test")
+		assert.Equal(t, tc.want.Field2.City, tc.in.Field2.City, "Field2 City do not match for test")
+		assert.Equal(t, tc.want.Field2.State, tc.in.Field2.State, "Field2 State do not match for test")
+
 	}
 }
